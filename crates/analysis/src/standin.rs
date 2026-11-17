@@ -9,7 +9,8 @@
 //! headers, credential query values, secret-shaped values in bodies, and any value the caller names
 //! are all dropped, and [`Dropped`] says how many. Bodies are otherwise kept: they're the answer.
 //!
-//! Replay is read-only. A write answers what was recorded and changes nothing later reads see.
+//! The analysis layer only selects recorded answers. The engine may layer bounded, session-local JSON
+//! mutations over those answers; it never claims to reproduce backend business logic.
 
 use crate::web_har::{CREDENTIAL_HEADERS, Redactor, is_credential_param, is_uuid, split_url};
 use craft_anything_formats::har::{self, Har, HarEntry, HarError};
