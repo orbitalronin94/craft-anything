@@ -198,6 +198,11 @@ fn recorded_json_writes_change_later_reads_within_the_running_session() {
         assert!(revised.contains("Revised") && revised.contains("\"active\":true"), "{revised}");
         assert!(revised.contains("X-Craft-Anything-Stand-In: simulated-state"), "{revised}");
 
+        let patched_again = send_json(&url, "PATCH", "/items/1", r#"{"active":false}"#);
+        assert!(patched_again.starts_with("HTTP/1.1 200"), "{patched_again}");
+        let merged_again = get(&url, "/items/1");
+        assert!(merged_again.contains("Revised") && merged_again.contains("\\"active\\":false"), "{merged_again}");
+
         let replaced = send_json(&url, "PUT", "/items/1", r#"{"id":1,"name":"Replacement"}"#);
         assert!(replaced.starts_with("HTTP/1.1 200"), "{replaced}");
         let replacement = get(&url, "/items/1");
