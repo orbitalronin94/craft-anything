@@ -286,9 +286,11 @@ struct Replay {
 const MAX_OVERLAY_RESOURCES: usize = 10_000;
 const MAX_OVERLAY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MUTATION_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OVERLAY_KEY_BYTES: usize = 4096;
 
-fn resource_key(path: &str, query: &str) -> String {
-    if query.is_empty() { path.to_string() } else { format!("{path}?{query}") }
+fn resource_key(path: &str, query: &str) -> Option<String> {
+    let key = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+    (key.len() <= MAX_OVERLAY_KEY_BYTES).then_some(key)
 }
 
 fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, Value>> {
@@ -336,7 +338,7 @@ impl Answerer for Replay {
 
         // A simulated resource takes precedence over its recorded starting point.
         if method == "GET" || method == "HEAD" {
-            let simulated = self.overlay.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+            let simulated = key.as_ref().and_then(|key| self.overlay.lock().unwrap_or_else(PoisonError::into_inner).get(key).cloned());
             if let Some(value) = simulated {
                 log.answered = log.answered.saturating_add(1);
                 let counter = log.by_route.entry("simulated-state GET".into()).or_insert(0);
@@ -372,10 +374,11 @@ impl Answerer for Replay {
                 // Only mutate after the recording itself says the write succeeded.
                 if successful(response.status) {
                     let mut overlay = self.overlay.lock().unwrap_or_else(PoisonError::into_inner);
-                    if method == "PATCH" || method == "PUT" || method == "DELETE" {
+                    if (method == "PATCH" || method == "PUT" || method == "DELETE") && key.is_some() {
                         // A resource is mutable only when its original GET response was recorded
                         // and contains a JSON object. This avoids inventing unknown resource shapes.
-                        let existing = overlay.get(&key).cloned();
+                        let key = key.as_ref().unwrap_or(&String::new());
+                        let existing = overlay.get(key).cloned();
                         let baseline = match existing {
                             Some(Some(bytes)) => json_object(&bytes),
                             Some(None) => None,
