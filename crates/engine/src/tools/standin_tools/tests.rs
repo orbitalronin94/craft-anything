@@ -33,7 +33,7 @@ fn write_entry(method: &str, url: &str, status: i64, request_body: &str, respons
 
 fn send_json(url: &str, method: &str, path: &str, body: &str) -> String {
     http(url, &format!(
-        "{method} {path} HTTP/1.1\\r\\nHost: {{HOST}}\\r\\nContent-Type: application/json\\r\\nContent-Length: {}\\r\\n\\r\\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {{HOST}}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     ))
 }
@@ -153,7 +153,6 @@ fn build_start_request_show_stop_through_the_engine() {
 }
 
 #[test]
-#[test]
 fn recorded_json_writes_change_later_reads_within_the_running_session() {
     within(60, || {
         let dir = crate::testing::temp_dir();
@@ -192,6 +191,7 @@ fn recorded_json_writes_change_later_reads_within_the_running_session() {
     });
 }
 
+#[test]
 fn a_fresh_client_gets_a_missing_cache_reason_instead_of_a_bare_304() {
     within(60, || {
         let dir = crate::testing::temp_dir();
