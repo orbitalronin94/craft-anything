@@ -284,6 +284,7 @@ struct Replay {
 }
 
 const MAX_OVERLAY_RESOURCES: usize = 10_000;
+const MAX_OVERLAY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MUTATION_JSON_BYTES: usize = 4 * 1024 * 1024;
 
 fn resource_key(path: &str, query: &str) -> String {
@@ -299,6 +300,20 @@ fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, Value>> {
 
 fn successful(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+fn store_overlay(overlay: &mut BTreeMap<String, Option<Vec<u8>>>, key: String, value: Option<Vec<u8>>) {
+    if !overlay.contains_key(&key) && overlay.len() >= MAX_OVERLAY_RESOURCES {
+        return;
+    }
+    let old_bytes = overlay.get(&key).and_then(Option::as_ref).map_or(0, Vec::len);
+    let used_bytes = overlay.values().fold(0usize, |total, value| {
+        total.saturating_add(value.as_ref().map_or(0, Vec::len))
+    });
+    let new_bytes = value.as_ref().map_or(0, Vec::len);
+    if used_bytes.saturating_sub(old_bytes).saturating_add(new_bytes) <= MAX_OVERLAY_TOTAL_BYTES {
+        overlay.insert(key, value);
+    }
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -365,7 +380,8 @@ impl Answerer for Replay {
                             None => {
                                 let mut probe_turns = turns.clone();
                                 match standin::answer(&self.standin, &mut probe_turns, "GET", &r.path, &r.query, &[]) {
-                                    Answer::Found(found) => json_object(&found.body),
+                                    Answer::Found(found) if successful(found.status) => json_object(&found.body),
+                                    Answer::Found(_) => None,
                                     Answer::NoMatch(_) => None,
                                 }
                             }
@@ -383,9 +399,7 @@ impl Answerer for Replay {
                                 _ => None,
                             };
                             if let Some(next) = next {
-                                if overlay.contains_key(&key) || overlay.len() < MAX_OVERLAY_RESOURCES {
-                                    overlay.insert(key, if method == "DELETE" { None } else { Some(next) });
-                                }
+                                store_overlay(&mut overlay, key.clone(), if method == "DELETE" { None } else { Some(next) });
                             }
                         }
                     } else if method == "POST" {
