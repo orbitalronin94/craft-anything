@@ -40,7 +40,7 @@ const STANDIN_STEPS: &[Step<Value>] = &[];
 const FIRST_STANDIN_VERSION: u32 = 1;
 const _: () = assert!(FIRST_STANDIN_VERSION as usize + STANDIN_STEPS.len() == STANDIN_VERSION as usize);
 
-const REPLAY_LIMIT: &str = "Replay is read-only: POST, PUT, PATCH and DELETE answer what was recorded and don't change what later reads return. Nothing here models the backend's state.";
+const REPLAY_LIMIT: &str = "Writes still require a recorded successful answer. JSON PATCH applies a shallow top-level merge to a recorded JSON object; JSON PUT replaces it; DELETE hides it from later reads. POST creates a resource only when the recorded response supplies a local Location and a JSON object body. This is a bounded, in-memory overlay, not the original backend's full business logic; other write semantics remain replay-only.";
 
 pub fn specs() -> Vec<ToolSpec> {
     vec![
@@ -278,6 +278,27 @@ struct Replay {
     standin: StandIn,
     /// Which answer each repeated request is up to, and what's been asked: one lock, one request at a time.
     state: Mutex<(Turns, Log)>,
+    /// Session-local simulated resources. None means a recorded resource was deleted.
+    /// Keys include the exact path and query; values are never persisted or logged.
+    overlay: Mutex<BTreeMap<String, Option<Vec<u8>>>>,
+}
+
+const MAX_OVERLAY_RESOURCES: usize = 10_000;
+const MAX_MUTATION_JSON_BYTES: usize = 4 * 1024 * 1024;
+
+fn resource_key(path: &str, query: &str) -> String {
+    if query.is_empty() { path.to_string() } else { format!("{path}?{query}") }
+}
+
+fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, Value>> {
+    if bytes.is_empty() || bytes.len() > MAX_MUTATION_JSON_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<Value>(bytes).ok()?.as_object().cloned()
+}
+
+fn successful(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -295,6 +316,27 @@ impl Answerer for Replay {
     fn answer(&self, r: &Request) -> Response {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let (turns, log) = &mut *guard;
+        let method = r.method.to_ascii_uppercase();
+        let key = resource_key(&r.path, &r.query);
+
+        // A simulated resource takes precedence over its recorded starting point.
+        if method == "GET" || method == "HEAD" {
+            let simulated = self.overlay.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+            if let Some(value) = simulated {
+                log.answered = log.answered.saturating_add(1);
+                let body = value.unwrap_or_default();
+                let status = if body.is_empty() { 404 } else { 200 };
+                return Response {
+                    status,
+                    headers: vec![
+                        ("Content-Type".into(), "application/json".into()),
+                        (ANSWER_HEADER.into(), "simulated-state".into()),
+                    ],
+                    body,
+                };
+            }
+        }
+
         match standin::answer(&self.standin, turns, &r.method, &r.path, &r.query, &r.body) {
             Answer::Found(f) => {
                 log.answered = log.answered.saturating_add(1);
@@ -308,7 +350,56 @@ impl Answerer for Replay {
                     headers.push(("Content-Type".into(), ct.clone()));
                 }
                 headers.push((ANSWER_HEADER.into(), "recorded".into()));
-                Response { status: f.status, headers, body: f.body }
+                let response = Response { status: f.status, headers, body: f.body };
+
+                // Only mutate after the recording itself says the write succeeded.
+                if successful(response.status) {
+                    let mut overlay = self.overlay.lock().unwrap_or_else(PoisonError::into_inner);
+                    if method == "PATCH" || method == "PUT" || method == "DELETE" {
+                        // A resource is mutable only when its original GET response was recorded
+                        // and contains a JSON object. This avoids inventing unknown resource shapes.
+                        let mut probe_turns = turns.clone();
+                        let baseline = match standin::answer(&self.standin, &mut probe_turns, "GET", &r.path, &r.query, &[]) {
+                            Answer::Found(found) => json_object(&found.body),
+                            Answer::NoMatch(_) => None,
+                        };
+                        if let Some(mut current) = baseline {
+                            let next = match method.as_str() {
+                                "PATCH" => json_object(&r.body).map(|patch| {
+                                    for (name, value) in patch {
+                                        current.insert(name, value);
+                                    }
+                                    serde_json::to_vec(&Value::Object(current)).unwrap_or_default()
+                                }),
+                                "PUT" => json_object(&r.body).and_then(|replacement| serde_json::to_vec(&Value::Object(replacement)).ok()),
+                                "DELETE" => Some(Vec::new()),
+                                _ => None,
+                            };
+                            if let Some(next) = next {
+                                if overlay.contains_key(&key) || overlay.len() < MAX_OVERLAY_RESOURCES {
+                                    overlay.insert(key, if method == "DELETE" { None } else { Some(next) });
+                                }
+                            }
+                        }
+                    } else if method == "POST" {
+                        // Creation is inferred only from an explicit local Location header.
+                        let location = response.headers.iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                            .map(|(_, value)| value.as_str());
+                        if let (Some(location), Some(body)) = (location, json_object(&response.body)) {
+                            if location.starts_with('/') && !location.starts_with("//")
+                                && !location.contains(['\r', '\n', '#'])
+                                && location.len() <= 2048
+                                && (overlay.contains_key(location) || overlay.len() < MAX_OVERLAY_RESOURCES)
+                            {
+                                if let Ok(bytes) = serde_json::to_vec(&Value::Object(body)) {
+                                    overlay.insert(location.to_string(), Some(bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                response
             }
             Answer::NoMatch(n) => {
                 log.no_answer = log.no_answer.saturating_add(1);
