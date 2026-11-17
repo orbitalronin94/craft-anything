@@ -1179,8 +1179,8 @@ fn fitting(all: Vec<usize>, route: &StandInRoute, key: Option<&str>) -> Vec<usiz
 
 /// The recorded answer for a request, trying the exact path and query, then the exact path, then the
 /// path template. A repeated request goes through the answers that fit in recording order, then starts
-/// again. This never changes the stand-in: a recorded write answers as recorded and later reads
-/// don't see it. `path` and `query` are as the client sent them.
+/// again. This pure analysis function never changes the description; any simulated state belongs to
+/// the running engine server. `path` and `query` are as the client sent them.
 pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, query: &str, body: &[u8]) -> Answer {
     let method = method.to_ascii_uppercase();
     // HEAD asks what GET would say; the server leaves out the body.
