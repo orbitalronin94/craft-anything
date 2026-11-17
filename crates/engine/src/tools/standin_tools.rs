@@ -402,7 +402,7 @@ impl Answerer for Replay {
                                 "DELETE" => Some(Vec::new()),
                                 _ => None,
                             };
-                            if let Some(next) = next {
+                            if let Some(next) = next.filter(|bytes| bytes.len() <= MAX_MUTATION_JSON_BYTES) {
                                 store_overlay(&mut overlay, key.to_string(), if method == "DELETE" { None } else { Some(next) });
                             }
                         }
