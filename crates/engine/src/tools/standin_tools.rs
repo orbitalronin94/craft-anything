@@ -58,7 +58,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_standin_start",
             "Start a stand-in backend",
-            "Answer HTTP requests on this computer from a file written by web_standin_build, and return its URL to point a rebuilt front end at. Listens on 127.0.0.1 only, refuses requests addressed to any other host and pages from other computers, and allows local pages through CORS. Stays running for this session, or until web_standin_stop. A request with no recorded answer gets a 404 with the nearest routes as JSON. Writes replay what was recorded and change nothing. Runs no code from the recording.",
+            "Answer HTTP requests on this computer from a file written by web_standin_build, and return its URL to point a rebuilt front end at. Listens on 127.0.0.1 only, refuses requests addressed to any other host and pages from other computers, and allows local pages through CORS. Stays running for this session, or until web_standin_stop. A request with no recorded answer gets a 404 with the nearest routes as JSON. Recorded writes may update a bounded, in-memory JSON overlay for later reads: PATCH shallow-merges object fields, PUT replaces an object, DELETE hides the resource, and POST creates only with a recorded local Location. Other write semantics remain replay-only. Runs no code from the recording.",
             "Start a local stand-in for a website's backend, answering from a recording.",
             Toolset::Browser,
             Effects::MUTATES_SESSION.union(Effects::ACCESSES_NETWORK),
@@ -227,7 +227,7 @@ fn web_standin_build(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         .confidence(Confidence::Observed)
         .authority(Authority::EarlierRecord)
         .limitation(Limitation::new("only_what_was_recorded", "This knows only the requests in the recording. A page or action nobody used while recording has no answer here, and an {id} in a template is inferred from how paths varied."))
-        .limitation(Limitation::new("read_only_replay", REPLAY_LIMIT))
+        .limitation(Limitation::new("bounded_state_overlay", REPLAY_LIMIT))
         .limitation(Limitation::new("secrets_dropped", format!("{dropped} credential or secret-shaped value(s) were dropped, so anything that needs a real session won't work. Other response text is kept as recorded, and may hold personal data: name it in hidden_values, and don't commit this file.")))
         .coverage(Coverage::page(shown, total as u64, p.offset as u64))
         .location(Location::new("path", out.display().to_string()));
@@ -358,10 +358,17 @@ impl Answerer for Replay {
                     if method == "PATCH" || method == "PUT" || method == "DELETE" {
                         // A resource is mutable only when its original GET response was recorded
                         // and contains a JSON object. This avoids inventing unknown resource shapes.
-                        let mut probe_turns = turns.clone();
-                        let baseline = match standin::answer(&self.standin, &mut probe_turns, "GET", &r.path, &r.query, &[]) {
-                            Answer::Found(found) => json_object(&found.body),
-                            Answer::NoMatch(_) => None,
+                        let existing = overlay.get(&key).cloned();
+                        let baseline = match existing {
+                            Some(Some(bytes)) => json_object(&bytes),
+                            Some(None) => None,
+                            None => {
+                                let mut probe_turns = turns.clone();
+                                match standin::answer(&self.standin, &mut probe_turns, "GET", &r.path, &r.query, &[]) {
+                                    Answer::Found(found) => json_object(&found.body),
+                                    Answer::NoMatch(_) => None,
+                                }
+                            }
                         };
                         if let Some(mut current) = baseline {
                             let next = match method.as_str() {
@@ -369,7 +376,7 @@ impl Answerer for Replay {
                                     for (name, value) in patch {
                                         current.insert(name, value);
                                     }
-                                    serde_json::to_vec(&Value::Object(current)).unwrap_or_default()
+                                    serde_json::to_vec(&Value::Object(current)).ok()?
                                 }),
                                 "PUT" => json_object(&r.body).and_then(|replacement| serde_json::to_vec(&Value::Object(replacement)).ok()),
                                 "DELETE" => Some(Vec::new()),
