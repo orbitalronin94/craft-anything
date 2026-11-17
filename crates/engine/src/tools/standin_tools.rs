@@ -388,7 +388,7 @@ impl Answerer for Replay {
                         };
                         if let Some(mut current) = baseline {
                             let next = match method.as_str() {
-                                "PATCH" => json_object(&r.body).map(|patch| {
+                                "PATCH" => json_object(&r.body).and_then(|patch| {
                                     for (name, value) in patch {
                                         current.insert(name, value);
                                     }
