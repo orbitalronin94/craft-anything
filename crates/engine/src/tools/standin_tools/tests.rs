@@ -15,6 +15,48 @@ fn entry(method: &str, url: &str, status: i64, body: &str) -> Value {
     })
 }
 
+fn write_entry(method: &str, url: &str, status: i64, request_body: &str, response_body: &str) -> Value {
+    json!({
+        "request": {
+            "method": method,
+            "url": url,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "postData": {"mimeType": "application/json", "text": request_body}
+        },
+        "response": {
+            "status": status,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "content": {"mimeType": "application/json", "text": response_body}
+        }
+    })
+}
+
+fn create_entry(url: &str, location: &str, body: &str) -> Value {
+    json!({
+        "request": {
+            "method": "POST",
+            "url": url,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "postData": {"mimeType": "application/json", "text": "{}"}
+        },
+        "response": {
+            "status": 201,
+            "headers": [
+                {"name": "Content-Type", "value": "application/json"},
+                {"name": "Location", "value": location}
+            ],
+            "content": {"mimeType": "application/json", "text": body}
+        }
+    })
+}
+
+fn send_json(url: &str, method: &str, path: &str, body: &str) -> String {
+    http(url, &format!(
+        "{method} {path} HTTP/1.1\r\nHost: {{HOST}}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
 /// A hand-written recording: every value in it is an obvious fake.
 fn recording(dir: &Path) -> PathBuf {
     let har = json!({"log": {"version": "1.2", "entries": [
@@ -71,7 +113,7 @@ fn build_start_request_show_stop_through_the_engine() {
         assert!(r["routes"].as_array().unwrap().iter().any(|x| x["template"] == "/users/{id}" && x["method"] == "GET"), "{r}");
         assert_eq!(r["dropped"]["headers"], 12, "two on each of six entries");
         let codes: Vec<&str> = built["limitations"].as_array().unwrap().iter().filter_map(|l| l["code"].as_str()).collect();
-        assert!(codes.contains(&"only_what_was_recorded") && codes.contains(&"read_only_replay") && codes.contains(&"secrets_dropped"), "{codes:?}");
+        assert!(codes.contains(&"only_what_was_recorded") && codes.contains(&"bounded_state_overlay") && codes.contains(&"secrets_dropped"), "{codes:?}");
 
         let written = std::fs::read_to_string(standin_file(&out)).unwrap();
         assert!(!written.contains("sk-test"), "{written}");
@@ -126,6 +168,56 @@ fn build_start_request_show_stop_through_the_engine() {
         // That its port is freed is tested where the server is (`dropping_a_server_frees_its_port`):
         // here, among tests that all take free ports, another one may be handed it at once.
         assert_eq!(call(&e, "web_standin_show", json!({})).unwrap()["result"]["servers"], json!([]));
+    });
+}
+
+#[test]
+fn recorded_json_writes_change_later_reads_within_the_running_session() {
+    within(60, || {
+        let dir = crate::testing::temp_dir();
+        let har = dir.join("stateful.har");
+        let entries = [
+            entry("GET", "https://api.example.test/items/1", 200, r#"{"id":1,"name":"Original","active":true}"#),
+            write_entry("PATCH", "https://api.example.test/items/1", 200, r#"{"name":"Revised"}"#, r#"{"id":1,"name":"Revised","active":true}"#),
+            write_entry("PUT", "https://api.example.test/items/1", 200, r#"{"id":1,"name":"Replacement"}"#, r#"{"id":1,"name":"Replacement"}"#),
+            write_entry("DELETE", "https://api.example.test/items/1", 204, "", ""),
+            create_entry("https://api.example.test/items", "/items/2", r#"{"id":2,"name":"Created"}"#),
+        ];
+        std::fs::write(&har, json!({"log": {"version": "1.2", "entries": entries}}).to_string()).unwrap();
+        let e = Engine::new(crate::testing::session());
+        let out = dir.join("stateful");
+        call(&e, "web_standin_build", json!({"path": har, "output_dir": out})).unwrap();
+        let started = call(&e, "web_standin_start", json!({"path": out})).unwrap();
+        let url = started["result"]["url"].as_str().unwrap().to_string();
+
+        let original = get(&url, "/items/1");
+        assert!(original.contains("Original"), "{original}");
+        let patched = send_json(&url, "PATCH", "/items/1", r#"{"name":"Revised"}"#);
+        assert!(patched.starts_with("HTTP/1.1 200"), "{patched}");
+        let revised = get(&url, "/items/1");
+        assert!(revised.contains("Revised") && revised.contains("\"active\":true"), "{revised}");
+        assert!(revised.contains("X-Craft-Anything-Stand-In: simulated-state"), "{revised}");
+
+        let patched_again = send_json(&url, "PATCH", "/items/1", r#"{"active":false}"#);
+        assert!(patched_again.starts_with("HTTP/1.1 200"), "{patched_again}");
+        let merged_again = get(&url, "/items/1");
+        assert!(merged_again.contains("Revised") && merged_again.contains("\"active\":false"), "{merged_again}");
+
+        let replaced = send_json(&url, "PUT", "/items/1", r#"{"id":1,"name":"Replacement"}"#);
+        assert!(replaced.starts_with("HTTP/1.1 200"), "{replaced}");
+        let replacement = get(&url, "/items/1");
+        assert!(replacement.contains("Replacement") && !replacement.contains("active"), "{replacement}");
+
+        let deleted = send_json(&url, "DELETE", "/items/1", "");
+        assert!(deleted.starts_with("HTTP/1.1 204"), "{deleted}");
+        let gone = get(&url, "/items/1");
+        assert!(gone.starts_with("HTTP/1.1 404") && gone.contains("simulated-state"), "{gone}");
+
+        let created = send_json(&url, "POST", "/items", "{}");
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let new_item = get(&url, "/items/2");
+        assert!(new_item.starts_with("HTTP/1.1 200") && new_item.contains("Created") && new_item.contains("simulated-state"), "{new_item}");
+        call(&e, "web_standin_stop", json!({"all": true})).unwrap();
     });
 }
 
@@ -294,7 +386,7 @@ fn missing_requests_page_most_asked_first_and_stay_bounded() {
 
 #[test]
 fn the_log_of_unanswered_requests_cannot_grow_without_end() {
-    let replay = Replay { standin: StandIn::default(), state: Mutex::default() };
+    let replay = Replay { standin: StandIn::default(), state: Mutex::default(), overlay: Mutex::default() };
     let long = "x".repeat(10_000);
     for i in 0..(MAX_MISSING + 25) {
         let r = Request { method: "GET".into(), path: format!("/{i}/{long}"), query: String::new(), body: Vec::new() };
@@ -309,7 +401,7 @@ fn the_log_of_unanswered_requests_cannot_grow_without_end() {
 
 #[test]
 fn secret_shaped_paths_are_not_logged() {
-    let replay = Replay { standin: StandIn::default(), state: Mutex::default() };
+    let replay = Replay { standin: StandIn::default(), state: Mutex::default(), overlay: Mutex::default() };
     let r = Request { method: "GET".into(), path: "/reset/sk-test-in-a-path-1234/done".into(), query: String::new(), body: b"sk-test-in-a-body-1234".to_vec() };
     let response = replay.answer(&r);
     assert!(!String::from_utf8_lossy(&response.body).contains("sk-test"));

@@ -2009,6 +2009,7 @@ Owner: open · Status: in progress
       released port that another listener may reuse
       — claimed: Afloat16, branch test/r3.11-standin-session-lifetime-20261103
 - [ ] Stand-in backend: writes that change later reads (recorded answers are replayed as they are)
+      — claimed: orbitalronin94, branch feature/r3.11-standin-stateful-writes-20261117
 - [x] Tell the builder about the stand-in backend in a website's brief, when the capture kept a
       recording (`capture/*.har`): what `web_standin_build`, `web_standin_start` and the rest do
       (`brief::standin_words`); Deep mode only, since Clean room reads nothing inside the original

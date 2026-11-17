@@ -40,7 +40,7 @@ const STANDIN_STEPS: &[Step<Value>] = &[];
 const FIRST_STANDIN_VERSION: u32 = 1;
 const _: () = assert!(FIRST_STANDIN_VERSION as usize + STANDIN_STEPS.len() == STANDIN_VERSION as usize);
 
-const REPLAY_LIMIT: &str = "Replay is read-only: POST, PUT, PATCH and DELETE answer what was recorded and don't change what later reads return. Nothing here models the backend's state.";
+const REPLAY_LIMIT: &str = "Writes still require a recorded successful answer. JSON PATCH applies a shallow top-level merge to a recorded JSON object; JSON PUT replaces it; DELETE hides it from later reads. POST creates a resource only when the recorded response supplies a local Location and a JSON object body. This is a bounded, in-memory overlay, not the original backend's full business logic; other write semantics remain replay-only.";
 
 pub fn specs() -> Vec<ToolSpec> {
     vec![
@@ -58,7 +58,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_standin_start",
             "Start a stand-in backend",
-            "Answer HTTP requests on this computer from a file written by web_standin_build, and return its URL to point a rebuilt front end at. Listens on 127.0.0.1 only, refuses requests addressed to any other host and pages from other computers, and allows local pages through CORS. Stays running for this session, or until web_standin_stop. A request with no recorded answer gets a 404 with the nearest routes as JSON. Writes replay what was recorded and change nothing. Runs no code from the recording.",
+            "Answer HTTP requests on this computer from a file written by web_standin_build, and return its URL to point a rebuilt front end at. Listens on 127.0.0.1 only, refuses requests addressed to any other host and pages from other computers, and allows local pages through CORS. Stays running for this session, or until web_standin_stop. A request with no recorded answer gets a 404 with the nearest routes as JSON. Recorded writes may update a bounded, in-memory JSON overlay for later reads: PATCH shallow-merges object fields, PUT replaces an object, DELETE hides the resource, and POST creates only with a recorded local Location. Other write semantics remain replay-only. Runs no code from the recording.",
             "Start a local stand-in for a website's backend, answering from a recording.",
             Toolset::Browser,
             Effects::MUTATES_SESSION.union(Effects::ACCESSES_NETWORK),
@@ -227,7 +227,7 @@ fn web_standin_build(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         .confidence(Confidence::Observed)
         .authority(Authority::EarlierRecord)
         .limitation(Limitation::new("only_what_was_recorded", "This knows only the requests in the recording. A page or action nobody used while recording has no answer here, and an {id} in a template is inferred from how paths varied."))
-        .limitation(Limitation::new("read_only_replay", REPLAY_LIMIT))
+        .limitation(Limitation::new("bounded_state_overlay", REPLAY_LIMIT))
         .limitation(Limitation::new("secrets_dropped", format!("{dropped} credential or secret-shaped value(s) were dropped, so anything that needs a real session won't work. Other response text is kept as recorded, and may hold personal data: name it in hidden_values, and don't commit this file.")))
         .coverage(Coverage::page(shown, total as u64, p.offset as u64))
         .location(Location::new("path", out.display().to_string()));
@@ -278,6 +278,44 @@ struct Replay {
     standin: StandIn,
     /// Which answer each repeated request is up to, and what's been asked: one lock, one request at a time.
     state: Mutex<(Turns, Log)>,
+    /// Session-local simulated resources. None means a recorded resource was deleted.
+    /// Keys include the exact path and query; values are never persisted or logged.
+    overlay: Mutex<BTreeMap<String, Option<Vec<u8>>>>,
+}
+
+const MAX_OVERLAY_RESOURCES: usize = 10_000;
+const MAX_OVERLAY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MUTATION_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OVERLAY_KEY_BYTES: usize = 4096;
+
+fn resource_key(path: &str, query: &str) -> Option<String> {
+    let key = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+    (key.len() <= MAX_OVERLAY_KEY_BYTES).then_some(key)
+}
+
+fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, Value>> {
+    if bytes.is_empty() || bytes.len() > MAX_MUTATION_JSON_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<Value>(bytes).ok()?.as_object().cloned()
+}
+
+fn successful(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+fn store_overlay(overlay: &mut BTreeMap<String, Option<Vec<u8>>>, key: String, value: Option<Vec<u8>>) {
+    if !overlay.contains_key(&key) && overlay.len() >= MAX_OVERLAY_RESOURCES {
+        return;
+    }
+    let old_bytes = overlay.get(&key).and_then(|value| value.as_ref()).map_or(0, |bytes| bytes.len());
+    let used_bytes = overlay.values().fold(0usize, |total, value| {
+        total.saturating_add(value.as_ref().map_or(0, |bytes| bytes.len()))
+    });
+    let new_bytes = value.as_ref().map_or(0, Vec::len);
+    if used_bytes.saturating_sub(old_bytes).saturating_add(new_bytes) <= MAX_OVERLAY_TOTAL_BYTES {
+        overlay.insert(key, value);
+    }
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -295,6 +333,29 @@ impl Answerer for Replay {
     fn answer(&self, r: &Request) -> Response {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let (turns, log) = &mut *guard;
+        let method = r.method.to_ascii_uppercase();
+        let key = resource_key(&r.path, &r.query);
+
+        // A simulated resource takes precedence over its recorded starting point.
+        if method == "GET" || method == "HEAD" {
+            let simulated = key.as_ref().and_then(|key| self.overlay.lock().unwrap_or_else(PoisonError::into_inner).get(key).cloned());
+            if let Some(value) = simulated {
+                log.answered = log.answered.saturating_add(1);
+                let counter = log.by_route.entry("simulated-state GET".into()).or_insert(0);
+                *counter = counter.saturating_add(1);
+                let body = value.unwrap_or_default();
+                let status = if body.is_empty() { 404 } else { 200 };
+                return Response {
+                    status,
+                    headers: vec![
+                        ("Content-Type".into(), "application/json".into()),
+                        (ANSWER_HEADER.into(), "simulated-state".into()),
+                    ],
+                    body,
+                };
+            }
+        }
+
         match standin::answer(&self.standin, turns, &r.method, &r.path, &r.query, &r.body) {
             Answer::Found(f) => {
                 log.answered = log.answered.saturating_add(1);
@@ -308,7 +369,61 @@ impl Answerer for Replay {
                     headers.push(("Content-Type".into(), ct.clone()));
                 }
                 headers.push((ANSWER_HEADER.into(), "recorded".into()));
-                Response { status: f.status, headers, body: f.body }
+                let response = Response { status: f.status, headers, body: f.body };
+
+                // Only mutate after the recording itself says the write succeeded.
+                if successful(response.status) {
+                    let mut overlay = self.overlay.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(key) = key.as_ref().filter(|_| matches!(method.as_str(), "PATCH" | "PUT" | "DELETE")) {
+                        // A resource is mutable only when its original GET response was recorded
+                        // and contains a JSON object. This avoids inventing unknown resource shapes.
+                        let existing = overlay.get(key).cloned();
+                        let baseline = match existing {
+                            Some(Some(bytes)) => json_object(&bytes),
+                            Some(None) => None,
+                            None => {
+                                let mut probe_turns = turns.clone();
+                                match standin::answer(&self.standin, &mut probe_turns, "GET", &r.path, &r.query, &[]) {
+                                    Answer::Found(found) if successful(found.status) => json_object(&found.body),
+                                    Answer::Found(_) => None,
+                                    Answer::NoMatch(_) => None,
+                                }
+                            }
+                        };
+                        if let Some(mut current) = baseline {
+                            let next = match method.as_str() {
+                                "PATCH" => json_object(&r.body).and_then(|patch| {
+                                    for (name, value) in patch {
+                                        current.insert(name, value);
+                                    }
+                                    serde_json::to_vec(&Value::Object(current)).ok()?
+                                }),
+                                "PUT" => json_object(&r.body).and_then(|replacement| serde_json::to_vec(&Value::Object(replacement)).ok()),
+                                "DELETE" => Some(Vec::new()),
+                                _ => None,
+                            };
+                            if let Some(next) = next.filter(|bytes| bytes.len() <= MAX_MUTATION_JSON_BYTES) {
+                                store_overlay(&mut overlay, key.to_string(), if method == "DELETE" { None } else { Some(next) });
+                            }
+                        }
+                    } else if method == "POST" {
+                        // Creation is inferred only from an explicit local Location header.
+                        let location = response.headers.iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                            .map(|(_, value)| value.as_str());
+                        if let (Some(location), Some(body)) = (location, json_object(&response.body)) {
+                            if location.starts_with('/') && !location.starts_with("//")
+                                && !location.contains('\r') && !location.contains('\n') && !location.contains('#')
+                                && location.len() <= 2048
+                            {
+                                if let Ok(bytes) = serde_json::to_vec(&Value::Object(body)) {
+                                    store_overlay(&mut overlay, location.to_string(), Some(bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                response
             }
             Answer::NoMatch(n) => {
                 log.no_answer = log.no_answer.saturating_add(1);
@@ -457,7 +572,7 @@ fn web_standin_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     // Checked before the old one stops, so a bad file leaves what's running alone.
     let standin = parse_standin(&bytes)?;
     let routes = standin.routes.len();
-    let replay = Arc::new(Replay { standin, state: Mutex::default() });
+    let replay = Arc::new(Replay { standin, state: Mutex::default(), overlay: Mutex::default() });
     let answerer: Arc<dyn Answerer> = replay.clone();
     // The file was rebuilt since it was loaded: answer from the new one, at the same address.
     let (port, taken_over) = match stale.as_ref().and_then(|id| all.running.lock().unwrap_or_else(PoisonError::into_inner).remove(id)) {
