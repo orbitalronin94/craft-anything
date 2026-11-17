@@ -411,10 +411,9 @@ impl Answerer for Replay {
                             if location.starts_with('/') && !location.starts_with("//")
                                 && !location.contains(['\r', '\n', '#'])
                                 && location.len() <= 2048
-                                && (overlay.contains_key(location) || overlay.len() < MAX_OVERLAY_RESOURCES)
                             {
                                 if let Ok(bytes) = serde_json::to_vec(&Value::Object(body)) {
-                                    overlay.insert(location.to_string(), Some(bytes));
+                                    store_overlay(&mut overlay, location.to_string(), Some(bytes));
                                 }
                             }
                         }
