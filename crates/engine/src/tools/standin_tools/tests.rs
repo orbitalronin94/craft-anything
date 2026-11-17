@@ -371,7 +371,7 @@ fn the_log_of_unanswered_requests_cannot_grow_without_end() {
 
 #[test]
 fn secret_shaped_paths_are_not_logged() {
-    let replay = Replay { standin: StandIn::default(), state: Mutex::default() };
+    let replay = Replay { standin: StandIn::default(), state: Mutex::default(), overlay: Mutex::default() };
     let r = Request { method: "GET".into(), path: "/reset/sk-test-in-a-path-1234/done".into(), query: String::new(), body: b"sk-test-in-a-body-1234".to_vec() };
     let response = replay.answer(&r);
     assert!(!String::from_utf8_lossy(&response.body).contains("sk-test"));
