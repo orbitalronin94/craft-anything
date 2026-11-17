@@ -31,6 +31,25 @@ fn write_entry(method: &str, url: &str, status: i64, request_body: &str, respons
     })
 }
 
+fn create_entry(url: &str, location: &str, body: &str) -> Value {
+    json!({
+        "request": {
+            "method": "POST",
+            "url": url,
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "postData": {"mimeType": "application/json", "text": "{}"}
+        },
+        "response": {
+            "status": 201,
+            "headers": [
+                {"name": "Content-Type", "value": "application/json"},
+                {"name": "Location", "value": location}
+            ],
+            "content": {"mimeType": "application/json", "text": body}
+        }
+    })
+}
+
 fn send_json(url: &str, method: &str, path: &str, body: &str) -> String {
     http(url, &format!(
         "{method} {path} HTTP/1.1\r\nHost: {{HOST}}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -162,6 +181,7 @@ fn recorded_json_writes_change_later_reads_within_the_running_session() {
             write_entry("PATCH", "https://api.example.test/items/1", 200, r#"{"name":"Revised"}"#, r#"{"id":1,"name":"Revised","active":true}"#),
             write_entry("PUT", "https://api.example.test/items/1", 200, r#"{"id":1,"name":"Replacement"}"#, r#"{"id":1,"name":"Replacement"}"#),
             write_entry("DELETE", "https://api.example.test/items/1", 204, "", ""),
+            create_entry("https://api.example.test/items", "/items/2", r#"{"id":2,"name":"Created"}"#),
         ];
         std::fs::write(&har, json!({"log": {"version": "1.2", "entries": entries}}).to_string()).unwrap();
         let e = Engine::new(crate::testing::session());
@@ -187,6 +207,11 @@ fn recorded_json_writes_change_later_reads_within_the_running_session() {
         assert!(deleted.starts_with("HTTP/1.1 204"), "{deleted}");
         let gone = get(&url, "/items/1");
         assert!(gone.starts_with("HTTP/1.1 404") && gone.contains("simulated-state"), "{gone}");
+
+        let created = send_json(&url, "POST", "/items", "{}");
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let new_item = get(&url, "/items/2");
+        assert!(new_item.starts_with("HTTP/1.1 200") && new_item.contains("Created") && new_item.contains("simulated-state"), "{new_item}");
         call(&e, "web_standin_stop", json!({"all": true})).unwrap();
     });
 }
