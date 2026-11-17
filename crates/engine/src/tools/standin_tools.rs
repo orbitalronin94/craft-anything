@@ -409,7 +409,7 @@ impl Answerer for Replay {
                             .map(|(_, value)| value.as_str());
                         if let (Some(location), Some(body)) = (location, json_object(&response.body)) {
                             if location.starts_with('/') && !location.starts_with("//")
-                                && !location.contains(['\r', '\n', '#'])
+                                && !location.contains('\r') && !location.contains('\n') && !location.contains('#')
                                 && location.len() <= 2048
                             {
                                 if let Ok(bytes) = serde_json::to_vec(&Value::Object(body)) {
