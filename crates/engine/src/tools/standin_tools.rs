@@ -339,6 +339,8 @@ impl Answerer for Replay {
             let simulated = self.overlay.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
             if let Some(value) = simulated {
                 log.answered = log.answered.saturating_add(1);
+                let counter = log.by_route.entry("simulated-state GET".into()).or_insert(0);
+                *counter = counter.saturating_add(1);
                 let body = value.unwrap_or_default();
                 let status = if body.is_empty() { 404 } else { 200 };
                 return Response {
