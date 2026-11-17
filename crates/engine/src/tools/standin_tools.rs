@@ -374,10 +374,9 @@ impl Answerer for Replay {
                 // Only mutate after the recording itself says the write succeeded.
                 if successful(response.status) {
                     let mut overlay = self.overlay.lock().unwrap_or_else(PoisonError::into_inner);
-                    if (method == "PATCH" || method == "PUT" || method == "DELETE") && key.is_some() {
+                    if let Some(key) = key.as_ref().filter(|_| matches!(method.as_str(), "PATCH" | "PUT" | "DELETE")) {
                         // A resource is mutable only when its original GET response was recorded
                         // and contains a JSON object. This avoids inventing unknown resource shapes.
-                        let key = key.as_ref().unwrap_or(&String::new());
                         let existing = overlay.get(key).cloned();
                         let baseline = match existing {
                             Some(Some(bytes)) => json_object(&bytes),
@@ -404,7 +403,7 @@ impl Answerer for Replay {
                                 _ => None,
                             };
                             if let Some(next) = next {
-                                store_overlay(&mut overlay, key.clone(), if method == "DELETE" { None } else { Some(next) });
+                                store_overlay(&mut overlay, key.to_string(), if method == "DELETE" { None } else { Some(next) });
                             }
                         }
                     } else if method == "POST" {
