@@ -308,9 +308,9 @@ fn store_overlay(overlay: &mut BTreeMap<String, Option<Vec<u8>>>, key: String, v
     if !overlay.contains_key(&key) && overlay.len() >= MAX_OVERLAY_RESOURCES {
         return;
     }
-    let old_bytes = overlay.get(&key).and_then(Option::as_ref).map_or(0, Vec::len);
+    let old_bytes = overlay.get(&key).and_then(|value| value.as_ref()).map_or(0, |bytes| bytes.len());
     let used_bytes = overlay.values().fold(0usize, |total, value| {
-        total.saturating_add(value.as_ref().map_or(0, Vec::len))
+        total.saturating_add(value.as_ref().map_or(0, |bytes| bytes.len()))
     });
     let new_bytes = value.as_ref().map_or(0, Vec::len);
     if used_bytes.saturating_sub(old_bytes).saturating_add(new_bytes) <= MAX_OVERLAY_TOTAL_BYTES {
