@@ -568,7 +568,7 @@ fn web_standin_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     // Checked before the old one stops, so a bad file leaves what's running alone.
     let standin = parse_standin(&bytes)?;
     let routes = standin.routes.len();
-    let replay = Arc::new(Replay { standin, state: Mutex::default() });
+    let replay = Arc::new(Replay { standin, state: Mutex::default(), overlay: Mutex::default() });
     let answerer: Arc<dyn Answerer> = replay.clone();
     // The file was rebuilt since it was loaded: answer from the new one, at the same address.
     let (port, taken_over) = match stale.as_ref().and_then(|id| all.running.lock().unwrap_or_else(PoisonError::into_inner).remove(id)) {
